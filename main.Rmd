@@ -1,0 +1,339 @@
+```{r}
+library(haven)
+library(dplyr)
+library(ggplot2)
+library(sf)
+library(zipcodeR)
+library(geosphere)
+library(readr)
+library(randomForest)
+library(fastshap)
+library(ggplot2)
+library(knitr)
+library(kableExtra)
+library(dplyr)
+```
+
+
+
+```{r}
+adi<-read_sas(adi_address)
+enc_df <- read_sas(file_enc)
+demo <- read_sas(demo_new)
+adres <- read_sas(file_lds_address_history)
+sofa <- read.csv(sofa_address, stringsAsFactors = FALSE)
+```
+
+
+
+```{r}
+adi_na_percentages <- adi %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100))
+
+print(adi_na_percentages)
+
+demo_na_percentages <- demo %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100))
+
+print(demo_na_percentages)
+
+enc_df_na_percentages <- enc_df %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100))
+
+print(enc_df_na_percentages)
+```
+
+
+
+
+```{r}
+
+# =============================================================================
+# 1. Compute Maximum SOFA Scores and Join to Encounter Data
+# =============================================================================
+# Calculate the highest total_SOFA score for each PATID and ENCOUNTERID
+max_sofa <- sofa %>%
+  group_by(PATID, ENCOUNTERID) %>%
+  summarise(max_total_SOFA = max(total_SOFA, na.rm = TRUE)) %>%
+  ungroup()
+
+print(max_sofa)
+
+# Join the computed SOFA scores to the encounter data (enc_df)
+enc_df <- enc_df %>%
+  left_join(max_sofa, by = c("PATID", "ENCOUNTERID"))
+# Now, enc_df contains a new column 'max_total_SOFA'
+
+# =============================================================================
+# 2. Address Data Processing
+# =============================================================================
+# Filter addresses to only those patients in the encounter data
+adres_filtered <- adres %>%
+  semi_join(enc_df, by = "PATID")
+
+# Get the latest address per patient
+latest_address <- adres_filtered %>%
+  group_by(PATID) %>%
+  arrange(desc(ADDRESS_PERIOD_START)) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(ZIP = coalesce(ADDRESS_ZIP5, substr(ADDRESS_ZIP9, 1, 5)))
+
+# =============================================================================
+# 3. Hospital Reference Data
+# =============================================================================
+# Create hospital ZIP code reference table
+hospital_zips <- tribble(
+  ~site_code, ~hospital_zip,
+  "HMC", "17033",
+  "HPD", "17025",
+  "HSM", "17011",
+  "LMC", "17601"
+)
+
+# Process encounter site codes and join hospital ZIP codes
+enc_processed <- enc_df %>%
+  mutate(site_code = substr(RAW_SITEID, 1, 3)) %>%
+  left_join(hospital_zips, by = "site_code")
+
+# =============================================================================
+# 4. Data Merging
+# =============================================================================
+# Merge encounter data with the latest addresses
+merged_data <- enc_df %>%
+  inner_join(latest_address, by = "PATID")
+
+# Select encounter-level columns (including the SOFA score from earlier)
+enc_selected <- enc_processed %>%
+  select(PATID, ENCOUNTERID, ADMIT_DATE, DISCHARGE_DATE, 
+         PROVIDERID, ENC_TYPE, FACILITYID, site_code, hospital_zip, max_total_SOFA)
+
+# Select address details from the merged address data
+merged_selected <- merged_data %>%
+  select(PATID, ADDRESSID, ADDRESS_TYPE, ADDRESS_CITY, ADDRESS_STATE, ZIP)
+
+# Combine encounter data with address details
+combined_data <- enc_selected %>%
+  left_join(merged_selected, by = "PATID") %>%
+  distinct()
+
+# =============================================================================
+# 5. Geographic Calculations
+# =============================================================================
+# Get ZIP code coordinates from the zipcodeR database
+zip_coords <- zipcodeR::zip_code_db %>%
+  select(zipcode, lat, lng)
+
+# Merge patient and hospital ZIP coordinates and calculate distance
+final_data <- combined_data %>%
+  left_join(zip_coords, by = c("ZIP" = "zipcode")) %>%
+  rename(patient_lat = lat, patient_lon = lng) %>%
+  left_join(zip_coords, by = c("hospital_zip" = "zipcode")) %>%
+  rename(hospital_lat = lat, hospital_lon = lng) %>%
+  rowwise() %>%
+  mutate(distance_meters = ifelse(
+    all(!is.na(c(patient_lon, patient_lat, hospital_lon, hospital_lat))),
+    distHaversine(c(patient_lon, patient_lat), c(hospital_lon, hospital_lat)),
+    NA_real_
+  )) %>%
+  ungroup()
+
+# =============================================================================
+# 6. Mortality & Outcome Processing
+# =============================================================================
+# Identify mortality cases from the encounter data (using discharge disposition)
+mortality <- enc_df %>%
+  filter(DISCHARGE_DISPOSITION == 'E') %>%
+  distinct(PATID) %>%
+  mutate(Dead = 1)
+
+# Merge mortality information with ADI data
+merged_df <- adi %>%
+  left_join(mortality, by = "PATID") %>%
+  mutate(Dead = coalesce(Dead, 0))
+
+# Clean ADI values
+merged_df <- merged_df %>%
+  mutate(
+    ADI_US = as.numeric(ADI_US),
+    ADI_state = as.numeric(ADI_state),
+    ADI_US = ifelse(ADI_US %in% 1:100, ADI_US, NA),
+    ADI_state = ifelse(ADI_state %in% 1:10, ADI_state, NA)
+  )
+
+# =============================================================================
+# 7. Final Dataset Preparation
+# =============================================================================
+# First, add distance in miles to the data from geographic calculations
+merged_df <- final_data %>%
+  distinct(PATID, distance_meters) %>%  # unique distance per patient
+  mutate(distance_miles = distance_meters / 1609.34) %>%  # convert meters to miles
+  select(-distance_meters) %>%
+  right_join(merged_df, by = "PATID")  # merge with the ADI/mortality dataset
+
+# Next, merge with the original encounter data to add clinical and demographic info.
+merged_df <- enc_df %>%
+  left_join(merged_df, by = "PATID") %>%
+  mutate(
+    los_days = as.numeric(as.Date(DISCHARGE_DATE) - as.Date(ADMIT_DATE)),
+    Age = as.numeric(difftime(ADMIT_DATE, BIRTH_DATE, units = "days") / 365.25),
+    Mortality = factor(Dead),
+    los_days = los_days + 0.1,  # Avoid zero values
+    Age_Group = cut(Age, breaks = c(-Inf, 65, Inf), labels = c("Under 65", "65+"))
+  )
+# Note: The column 'max_total_SOFA' is already part of enc_df from Step 1 and will be carried forward.
+
+# =============================================================================
+# 8. Data Validation & Cleaning
+# =============================================================================
+# Check percentage of missing values per column in final_data
+final_na <- final_data %>%
+  summarise(across(everything(), ~ mean(is.na(.)) * 100))
+print(final_na)
+
+# Create a clean analysis dataset by filtering on ADI and removing remaining NAs
+merged_df_clean <- merged_df %>%
+  filter(!is.na(ADI_US)) %>%
+  na.omit()
+
+# =============================================================================
+# 9. Summary Statistics
+# =============================================================================
+# View some geographic info
+final_data %>%
+  select(PATID, ZIP, hospital_zip, distance_meters) %>%
+  head()
+
+# Encounter type distribution
+print(table(merged_df$ENC_TYPE))
+
+# Age group distribution and overall summary
+print(table(merged_df_clean$Age_Group))
+summary(merged_df_clean)
+```
+
+
+
+Preprocessing data
+
+
+
+```{r}
+# Removing the outlier ans scaling the continuous data
+remove_outliers <- function(x) {
+  qnt <- quantile(x, probs = c(0.25, 0.75), na.rm = TRUE)
+  iqr <- qnt[2] - qnt[1]
+  lower <- qnt[1] - 1.5 * iqr
+  upper <- qnt[2] + 1.5 * iqr
+  return(x >= lower & x <= upper)
+}
+
+merged_df_clean <- merged_df_clean %>%
+  filter(
+    remove_outliers(ADI_US),
+    remove_outliers(distance_miles),
+     remove_outliers(max_total_SOFA),
+  )
+
+merged_df_clean <- merged_df_clean %>%
+  mutate(
+    ADI_US_scaled = as.numeric(scale(ADI_US)),
+    distance_miles_scaled = as.numeric(scale(distance_miles))
+  )
+merged_df_clean <- merged_df_clean %>%
+  mutate(insurance = factor(ifelse(RAW_PAYER_NAME_PRIMARY %in% c("MEDICARE", "MEDICAID"), "Public", "Private")))
+
+categorical_vars <- c("Age_Group", "SEX", "RACE", "ENC_TYPE","RUCA_CODE", "insurance") #I removed the RUCA from here
+merged_df_clean <- merged_df_clean %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+merged_df_clean <- merged_df_clean[merged_df_clean$SEX != "UN"
+                                   & merged_df_clean$RACE!="NI", ]
+
+```
+
+
+Statistics of the # of patients and encounter times after cleaning
+
+```{r}
+num_unique_patids <- merged_df_clean %>% 
+  summarise(unique_patients = n_distinct(PATID))
+
+print(num_unique_patids)
+
+num_unique_encounters <- merged_df_clean %>% 
+  summarise(unique_encounters = n_distinct(ENCOUNTERID))
+
+print(num_unique_encounters)
+```
+
+***
+Model
+***
+```{r}
+# GLM model with Gamma kernel
+
+model_los <- glm(los_days ~ ADI_US_scaled + distance_miles_scaled + Age_Group + SEX + RACE + RUCA_CODE +ENC_TYPE + insurance +max_total_SOFA,
+                family = Gamma(link = "log"),
+                data = merged_df_clean)
+summary(model_los)
+```
+
+
+
+```{r}
+model_tidy_exp <- broom::tidy(model_los, conf.int = TRUE) %>%
+  mutate(
+    estimate_exp = exp(estimate),
+    conf.low_exp = exp(conf.low),
+    conf.high_exp = exp(conf.high)
+  ) %>%
+  filter(term != "(Intercept)") %>%
+  arrange(desc(estimate_exp))
+
+
+res_df_ordered <- model_tidy %>%
+  arrange(p.value)
+
+
+#make a table of the results
+
+kable(
+  res_df_ordered, 
+  format = "html",      # or "latex" if knitting to PDF
+  digits = 3,           # round numeric columns to 3 decimals
+  caption = "Regression Results with BH-Adjusted p-values"
+) %>%
+  kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+
+```
+
+
+```{r}
+# Save the random forest model
+# saveRDS(rf_model, file = "D:/PCORnet/parquet/rf_model_adi_distnce_sofa.rds")
+# Save the model and computed Shapley values to an RData file
+# save(rf_model, shap_vals, shap_importance, importance_df, file = "D:/PCORnet/parquet/rf_model_and_shap.RData")
+
+write.csv(merged_df_clean,"D:/PCORnet/parquet/data_shap.csv", row.names = FALSE )
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
